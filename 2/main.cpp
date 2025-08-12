@@ -12,7 +12,9 @@
 
 #include <immintrin.h>
 
-std::vector<double> load_vector_from_file(const std::string& filepath) {
+std::vector<double> load_vector_from_file(
+	const std::string& filepath
+) {
     std::ifstream file(filepath);
     if (!file.is_open()) {
         throw std::runtime_error("Could not open file: " + filepath);
@@ -55,6 +57,11 @@ bool verify_results(
     return true;
 }
 
+/*
+ * Implements a naive Finite Impulse Response (FIR) filter using direct convolution.
+ * This is a "naive" implementation because its time complexity is O(N * M),
+ * where N is the number of samples and M is the number of taps.
+ */
 std::vector<double> fir_naive_vec(
     const std::vector<double>& x, 
     const std::vector<double>& h
@@ -78,7 +85,25 @@ std::vector<double> fir_naive_vec(
     return y;
 }
 
-std::vector<double> fir_avx2d_vec(
+/*
+ * This is SIMD optimized version of Finite Impulse Response (FIR) filter using AVX2 instructions.
+ *
+ * Explanation of optimization:
+ * SIMD allows to perform single operation on multiple data (hence the name).
+ * 
+ * One AVX register stores 4 double values.
+ * This code attempts to explicitly make use of 15 registers out of 16, but reality is up to compiler.
+ * 7 Accumulators are allocated, each capable of storing 4 double values.
+ * In each inner iteration 7 input are laoded from vector per 1 tap value.
+ * Tap value is broadcasted to all registers.
+ * Then FMA (_mm256_fmadd) is used to multiply and add data as a * b + c in a single instruction.
+ * This way this function computes 28 values per interation.
+ *
+ * Manual unrolling here created 7 explicit independent dependency chains in the inner loop.
+ * It is also important to take into account FMA latency which this code hides by instruction level parallelism.
+ */
+
+std::vector<double> fir_avx2d_vec( //d stands for double
     const std::vector<double>& x, 
     const std::vector<double>& h
 ) {
@@ -96,8 +121,6 @@ std::vector<double> fir_avx2d_vec(
     const size_t VEC_SIZE = 4;      // 256 / 8 / sizeof(double) = 4
     size_t i = 0;
 
-    // Processes 8 output samples per iteration.
-    // Stops when there are fewer than 8 samples remaining.
     for (; i + VEC_SIZE * 7 <= sample_n; i += VEC_SIZE * 7) {
 
         __m256d y_vec0 = _mm256_setzero_pd(); // For y[i...i+3]
@@ -122,7 +145,6 @@ std::vector<double> fir_avx2d_vec(
 			* This code has 1 cycle penalty for unaligned loads.
             */
 
-            // Load 8 contiguous samples from the padded input
             const __m256d x_vec0 = _mm256_loadu_pd(x_ptr + VEC_SIZE * 0); // Loads x for y[i..i+3]
 			const __m256d x_vec1 = _mm256_loadu_pd(x_ptr + VEC_SIZE * 1); // y[i+4..i+7]
 			const __m256d x_vec2 = _mm256_loadu_pd(x_ptr + VEC_SIZE * 2); // y[i+8..i+11]
@@ -140,7 +162,6 @@ std::vector<double> fir_avx2d_vec(
             y_vec6 = _mm256_fmadd_pd(h_vec, x_vec6, y_vec6);
         }
 
-		// Store the 8 computed results in the output vectors `y`.
         _mm256_storeu_pd(&y[i + VEC_SIZE * 0], y_vec0);
         _mm256_storeu_pd(&y[i + VEC_SIZE * 1], y_vec1);
         _mm256_storeu_pd(&y[i + VEC_SIZE * 2], y_vec2);
@@ -208,3 +229,4 @@ int main(void) {
 
     return 0;
 }
+
