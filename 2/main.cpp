@@ -99,11 +99,10 @@ std::vector<double> fir_naive_vec(
  * Then FMA (_mm256_fmadd) is used to multiply and add data as a * b + c in a single instruction.
  * This way this function computes 28 values per interation.
  *
- * Manual unrolling here created 7 explicit independent dependency chains in the inner loop.
+ * Manual unrolling here creates 7 independent dependency chains in the inner loop.
  * It is also important to take into account FMA latency which this code hides by instruction level parallelism.
  */
-
-std::vector<double> fir_avx2d_vec( //d stands for double
+std::vector<double> fir_avx2d_vec(
     const std::vector<double>& x, 
     const std::vector<double>& h
 ) {
@@ -112,63 +111,47 @@ std::vector<double> fir_avx2d_vec( //d stands for double
 
     std::vector<double> y(sample_n, 0.0);
 
-    if (sample_n == 0) return {};
-    if (taps_n == 0) return y;
+    if (sample_n == 0) {
+        return {};
+    }
+    if (taps_n == 0) {
+        return y;
+    }
     
-    alignas(32) std::vector<double> x_padded(taps_n - 1 + sample_n, 0.0);
+    // Pad the input signal 'x' at the beginning with 'taps_n - 1' zeros.
+    // This simplifies the inner loop by removing the need for boundary checks.
+    // data here is still unaligned which is fine as modern CPUs have only 
+	// 1 cycle penalty for unaligned loads as long as data is in L1 cache.
+    std::vector<double> x_padded(taps_n - 1 + sample_n, 0.0);
     std::copy(x.begin(), x.end(), x_padded.begin() + taps_n - 1);
 
-    const size_t VEC_SIZE = 4;      // 256 / 8 / sizeof(double) = 4
+    constexpr size_t VEC_SIZE = 256 / 8 / sizeof(double);
+    const size_t UNROLL_FACTOR = 7;
+	const size_t unroll_step = VEC_SIZE * UNROLL_FACTOR;
+
+	std::array<__m256d, UNROLL_FACTOR> y_vecs;
+
     size_t i = 0;
+    for (; i + unroll_step <= sample_n; i += unroll_step) {
 
-    for (; i + VEC_SIZE * 7 <= sample_n; i += VEC_SIZE * 7) {
-
-        __m256d y_vec0 = _mm256_setzero_pd(); // For y[i...i+3]
-        __m256d y_vec1 = _mm256_setzero_pd(); // For y[i+4...i+7]
-        __m256d y_vec2 = _mm256_setzero_pd(); // For y[i+8...i+11]
-        __m256d y_vec3 = _mm256_setzero_pd(); // For y[i+12...i+15]
-        __m256d y_vec4 = _mm256_setzero_pd(); // For y[i+16...i+19]
-        __m256d y_vec5 = _mm256_setzero_pd(); // For y[i+20...i+23]
-        __m256d y_vec6 = _mm256_setzero_pd(); // For y[i+24...i+27]
+		y_vecs.fill(_mm256_setzero_pd());
 
         for (size_t j = 0; j < taps_n; ++j) {
-            // Broadcast coefficent
+            // Broadcast current coefficent
             const __m256d h_vec = _mm256_set1_pd(h[j]);
 
             // The pointer to the start of the padded data for this iteration
             const double* x_ptr = &x_padded[i + taps_n - 1 - j];
-
-            /*
-            * Since Haswell (2013) alignment penalty is reduced drastically 
-            * given that data is loaded in L1 cache.
-            * 
-			* This code has 1 cycle penalty for unaligned loads.
-            */
-
-            const __m256d x_vec0 = _mm256_loadu_pd(x_ptr + VEC_SIZE * 0); // Loads x for y[i..i+3]
-			const __m256d x_vec1 = _mm256_loadu_pd(x_ptr + VEC_SIZE * 1); // y[i+4..i+7]
-			const __m256d x_vec2 = _mm256_loadu_pd(x_ptr + VEC_SIZE * 2); // y[i+8..i+11]
-            const __m256d x_vec3 = _mm256_loadu_pd(x_ptr + VEC_SIZE * 3); // ...
-            const __m256d x_vec4 = _mm256_loadu_pd(x_ptr + VEC_SIZE * 4);
-            const __m256d x_vec5 = _mm256_loadu_pd(x_ptr + VEC_SIZE * 5);
-			const __m256d x_vec6 = _mm256_loadu_pd(x_ptr + VEC_SIZE * 6); // y[i+24..i+27]
-
-            y_vec0 = _mm256_fmadd_pd(h_vec, x_vec0, y_vec0);
-            y_vec1 = _mm256_fmadd_pd(h_vec, x_vec1, y_vec1);
-            y_vec2 = _mm256_fmadd_pd(h_vec, x_vec2, y_vec2);
-            y_vec3 = _mm256_fmadd_pd(h_vec, x_vec3, y_vec3);
-            y_vec4 = _mm256_fmadd_pd(h_vec, x_vec4, y_vec4);
-            y_vec5 = _mm256_fmadd_pd(h_vec, x_vec5, y_vec5);
-            y_vec6 = _mm256_fmadd_pd(h_vec, x_vec6, y_vec6);
+            
+            for (size_t k = 0; k < UNROLL_FACTOR; ++k) {
+                const __m256d x_vec = _mm256_loadu_pd(x_ptr + VEC_SIZE * k);
+                y_vecs[k] = _mm256_fmadd_pd(h_vec, x_vec, y_vecs[k]);
+            }
         }
 
-        _mm256_storeu_pd(&y[i + VEC_SIZE * 0], y_vec0);
-        _mm256_storeu_pd(&y[i + VEC_SIZE * 1], y_vec1);
-        _mm256_storeu_pd(&y[i + VEC_SIZE * 2], y_vec2);
-        _mm256_storeu_pd(&y[i + VEC_SIZE * 3], y_vec3);
-        _mm256_storeu_pd(&y[i + VEC_SIZE * 4], y_vec4);
-        _mm256_storeu_pd(&y[i + VEC_SIZE * 5], y_vec5);
-        _mm256_storeu_pd(&y[i + VEC_SIZE * 6], y_vec6);
+        for (size_t k = 0; k < UNROLL_FACTOR; ++k) {
+            _mm256_storeu_pd(&y[i + VEC_SIZE * k], y_vecs[k]);
+        }
     }
 
     // Compute rest with scalar method
